@@ -24,7 +24,7 @@ from torchao.float8.float8_tensor import (
     ScaledMMConfig,
     tensor_already_casted_to_fp8,
 )
-from torchao.float8.float8_utils import e4m3_dtype, tensor_to_scale
+from torchao.float8.float8_utils import e4m3_dtype, tensor_to_scale, to_fp8_saturated
 
 
 class ActivationCasting(Enum):
@@ -52,6 +52,7 @@ class QuantConfig:
 
     activation_casting: ActivationCasting
     static_quantization_scale: Optional[torch.Tensor] = None
+    dynamic_activation_quantization_ub: Optional[torch.Tensor] = None
 
     # If True, then prior to performing the fp8 scaled mamtmul we will pad the
     # inner dimension of a (dim 1) and b (dim 2) with 0s. This is needed for matmuls
@@ -172,6 +173,82 @@ class Float8InferenceLinear(torch.nn.Linear):
         linear.quantize_weight()
         return linear
 
+class FbgemmFloat8InferenceLinear(torch.nn.Linear):
+    """
+    This is a wrapper around torch.nn.Linear that supports FP8 inference
+    using Fbgemm gen_ai kernels
+    Supported forms of inference:
+        - FP8 inference dynamic activation per-token quantization with upperbound 
+          and static per-channel weight quantization
+        - FP8 inference static activation per-token quantization and static 
+          per-channel weight quantization
+    """
+
+    def __init__(
+        self,
+        quant_config: QuantConfig,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+    ) -> None:
+        # Construct the superclass this will create dummy weights and biases
+        super().__init__(in_features, out_features, bias, torch.device('meta'))
+        self.activation_casting = quant_config.activation_casting
+        if self.activation_casting == ActivationCasting.STATIC:
+            assert quant_config.static_quantization_scale is not None
+            self.register_buffer(
+                "input_scale", quant_config.static_quantization_scale
+            )
+        else:
+            self.input_scale = None
+
+        if self.activation_casting == ActivationCasting.DYNAMIC:
+            if quant_config.dynamic_activation_quantization_ub is not None:
+                self.register_buffer(
+                    "dynamic_activation_quantization_ub", quant_config.dynamic_activation_quantization_ub
+                )
+        else:
+            self.dynamic_activation_quantization_ub = None
+        
+        self._is_loaded = False
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        assert self._is_loaded, "Must call set_weight_and_bias to set real device tensors before calling forward!"
+        
+        if self.activation_casting == ActivationCasting.DYNAMIC:
+            aq, ascale = torch.ops.fbgemm.quantize_fp8_per_row(input, scale_ub=self.dynamic_activation_quantization_ub)
+        elif self.activation_casting == ActivationCasting.STATIC:
+            ascale = self.input_scale
+            ascaled = input * self.input_scale
+            aq = to_fp8_saturated(ascaled, torch.float8_e4m3fn)
+
+        output = torch.ops.fbgemm.f8f8bf16_rowwise(aq, self.weight, ascale, self.weight_scale, use_fast_accum=True)
+
+        if self.bias is not None:
+            output += self.bias
+
+        return output
+
+    # Called by the loader to load real values from a checkpoint
+    def load_parameters(
+        self,
+        quantized_weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ):
+        assert quantized_weight.dtype == torch.float8_e4m3fn
+        assert weight_scale.dtype == torch.float32
+        assert weight_scale.shape[0] == quantized_weight.shape[0]
+        
+        self.weight = nn.Parameter(quantized_weight)
+        self.weight.requires_grad = False
+        self.register_buffer('weight_scale', weight_scale)
+        
+        if bias is not None:
+            self.bias = nn.Parameter(bias)
+            self.bias.requires_grad = False
+
+        self._is_loaded = True
 
 def cast_to_float8_e4m3_inference(
     inpt_tensor: torch.Tensor,
