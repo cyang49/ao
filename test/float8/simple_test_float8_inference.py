@@ -68,6 +68,7 @@ quant_config = QuantConfig(activation_casting=ActivationCasting.STATIC,
                         # Even though the kernel takes scalar input scale here, 
                         # the results will have large error compared to using a column
                         # vector
+                        # See https://github.com/pytorch/FBGEMM/blob/9c0aa2a2501e8cd962bb25ba27ee2bef4e9bfc66/fbgemm_gpu/experimental/gen_ai/src/quantize/cutlass_extensions.cu#L578-L582
                         #  static_quantization_scale=torch.tensor(1.0),
                            static_quantization_scale=torch.full((M, 1), 1.0),
                )
@@ -80,4 +81,13 @@ with torch.no_grad():
 print(f"{out_fbgemm_linear=}")
 print(f"l2norm={(out_bf16-out_fbgemm_linear).norm(p=2)}")
 
+# Test compiled
+compiled_fbgemm_fp8_linear = torch.compile(
+            fbgemm_fp8_linear, backend="inductor", mode="reduce-overhead", fullgraph=True
+        )
+with torch.cuda.profiler.profile():
+    with torch.no_grad(): 
+        out_fbgemm_linear = compiled_fbgemm_fp8_linear(input_act)
 
+print(f"{out_fbgemm_linear=}")
+print(f"l2norm={(out_bf16-out_fbgemm_linear).norm(p=2)}")
